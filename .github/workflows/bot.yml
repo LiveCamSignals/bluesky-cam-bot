@@ -2,7 +2,7 @@ name: Bluesky Cam Bot
 
 on:
   schedule:
-    - cron: "*/14 * * * *"
+    - cron: "*/12 * * * *"
   workflow_dispatch:
 
 jobs:
