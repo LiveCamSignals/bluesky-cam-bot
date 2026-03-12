@@ -1,6 +1,10 @@
 import os
+import re
+import sqlite3
+import random
 import logging
 import requests
+from datetime import datetime, timedelta
 from atproto import Client, models
 
 API_URL = "https://chaturbate.com/affiliates/api/onlinerooms/?format=json&wm=T2CSW"
@@ -8,55 +12,150 @@ API_URL = "https://chaturbate.com/affiliates/api/onlinerooms/?format=json&wm=T2C
 BLUESKY_HANDLE = os.getenv("BLUESKY_HANDLE")
 BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD")
 
+DB_FILE = "posted.db"
+
 logging.basicConfig(level=logging.INFO)
 
 session = requests.Session()
 
 
 # -----------------------------
-# FACET BUILDER
+# DATABASE
+# -----------------------------
+
+def init_db():
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS posted (
+        username TEXT,
+        last_post TEXT
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def recently_posted(username):
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    c.execute(
+        "SELECT last_post FROM posted WHERE username=?",
+        (username,)
+    )
+
+    row = c.fetchone()
+
+    conn.close()
+
+    if not row:
+        return False
+
+    last = datetime.fromisoformat(row[0])
+
+    return datetime.now() - last < timedelta(days=30)
+
+
+def save_post(username):
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    c.execute(
+        "INSERT INTO posted VALUES (?, ?)",
+        (username, datetime.now().isoformat())
+    )
+
+    conn.commit()
+    conn.close()
+
+
+# -----------------------------
+# TAG CLEANER
+# -----------------------------
+
+def clean_tag(tag):
+
+    tag = tag.lower()
+    tag = re.sub(r"[^a-z0-9]", "", tag)
+
+    return tag
+
+
+# -----------------------------
+# BUILD HASHTAGS
+# -----------------------------
+
+def build_hashtags(room):
+
+    tags = room.get("tags", [])
+
+    cleaned = []
+
+    for t in tags:
+
+        tag = clean_tag(t)
+
+        if tag and tag not in cleaned:
+            cleaned.append(tag)
+
+    cleaned = cleaned[:5]
+
+    cleaned.extend(["LiveCams", "Chaturbate", "nsfw"])
+
+    return cleaned
+
+
+# -----------------------------
+# FACETS
 # -----------------------------
 
 def build_facets(text, link, hashtags):
 
     facets = []
 
-    def get_bytes(sub):
+    def byte_range(sub):
+
         start = text.find(sub)
+
         if start == -1:
             return None
 
-        byte_start = len(text[:start].encode("utf-8"))
-        byte_end = byte_start + len(sub.encode("utf-8"))
+        start_byte = len(text[:start].encode("utf-8"))
+        end_byte = start_byte + len(sub.encode("utf-8"))
 
         return models.AppBskyRichtextFacet.ByteSlice(
-            byteStart=byte_start,
-            byteEnd=byte_end
+            byteStart=start_byte,
+            byteEnd=end_byte
         )
 
-    # clickable link
-    link_text = "Watch free"
-    index = get_bytes(link_text)
+    link_index = byte_range("Watch free")
 
-    if index:
+    if link_index:
+
         facets.append(
             models.AppBskyRichtextFacet.Main(
-                index=index,
+                index=link_index,
                 features=[models.AppBskyRichtextFacet.Link(uri=link)]
             )
         )
 
-    # clickable hashtags
     for tag in hashtags:
 
         tag_text = f"#{tag}"
 
-        index = get_bytes(tag_text)
+        idx = byte_range(tag_text)
 
-        if index:
+        if idx:
+
             facets.append(
                 models.AppBskyRichtextFacet.Main(
-                    index=index,
+                    index=idx,
                     features=[models.AppBskyRichtextFacet.Tag(tag=tag)]
                 )
             )
@@ -70,48 +169,58 @@ def build_facets(text, link, hashtags):
 
 def fetch_rooms():
 
-    logging.info("Fetching rooms from API")
+    logging.info("Fetching rooms")
 
     r = session.get(API_URL, timeout=20)
+
     r.raise_for_status()
 
-    data = r.json()
-
-    logging.info(f"{len(data)} rooms received")
-
-    return data
+    return r.json()
 
 
 # -----------------------------
-# SELECT ROOM
+# NICHE FILTER
 # -----------------------------
 
-def select_room(rooms):
+NICHES = {
+    "bbw": ["bbw"],
+    "milf": ["milf"],
+    "asian": ["asian"],
+    "latina": ["latina"],
+    "ebony": ["ebony"]
+}
 
-    # basic safe filter
-    candidates = [
-        r for r in rooms
-        if r.get("gender") == "f"
-        and r.get("current_show") == "public"
-    ]
 
-    if not candidates:
-        logging.info("No filtered rooms, using full list")
-        candidates = rooms
+def filter_rooms(rooms, niche):
 
-    # sort by viewers
-    candidates.sort(
+    tags = NICHES[niche]
+
+    results = []
+
+    for r in rooms:
+
+        if r.get("gender") != "f":
+            continue
+
+        if r.get("current_show") != "public":
+            continue
+
+        room_tags = [t.lower() for t in r.get("tags", [])]
+
+        if not any(t in room_tags for t in tags):
+            continue
+
+        if recently_posted(r["username"]):
+            continue
+
+        results.append(r)
+
+    results.sort(
         key=lambda x: int(x.get("num_users", 0)),
         reverse=True
     )
 
-    room = candidates[0]
-
-    logging.info(
-        f"Selected {room['username']} with {room['num_users']} viewers"
-    )
-
-    return room
+    return results
 
 
 # -----------------------------
@@ -129,25 +238,16 @@ def build_post(room):
     if len(subject) > 80:
         subject = subject[:80] + "..."
 
-    # performer tags
-    tags = room.get("tags", [])[:5]
+    hashtags = build_hashtags(room)
 
-    hashtags = [t.replace(" ", "") for t in tags]
-
-    hashtags.extend([
-        "LiveCams",
-        "Chaturbate",
-        "nsfw"
-    ])
-
-    hashtag_text = " ".join(f"#{h}" for h in hashtags)
+    tag_text = " ".join(f"#{t}" for t in hashtags)
 
     text = (
         f"🔥 {username} LIVE NOW ({viewers} watching)\n\n"
         f"{username} • {age} • {country}\n"
         f"{subject}\n\n"
         f"👉 Watch free\n\n"
-        f"{hashtag_text}"
+        f"{tag_text}"
     )
 
     return text, hashtags
@@ -159,19 +259,19 @@ def build_post(room):
 
 def post_room(client, room):
 
-    image_url = room.get("image_url")
+    logging.info("Downloading image")
 
-    logging.info("Downloading thumbnail")
-
-    img = session.get(image_url, timeout=15).content
+    img = session.get(room["image_url"], timeout=15).content
 
     text, hashtags = build_post(room)
 
-    link = room["chat_room_url_revshare"]
+    facets = build_facets(
+        text,
+        room["chat_room_url_revshare"],
+        hashtags
+    )
 
-    facets = build_facets(text, link, hashtags)
-
-    logging.info("Posting to Bluesky")
+    logging.info(f"Posting {room['username']}")
 
     client.send_image(
         text=text,
@@ -180,7 +280,7 @@ def post_room(client, room):
         facets=facets
     )
 
-    logging.info("Post successful")
+    save_post(room["username"])
 
 
 # -----------------------------
@@ -189,7 +289,7 @@ def post_room(client, room):
 
 def main():
 
-    logging.info("Bot starting")
+    init_db()
 
     client = Client()
 
@@ -199,14 +299,24 @@ def main():
 
     rooms = fetch_rooms()
 
-    room = select_room(rooms)
+    niche = random.choice(list(NICHES.keys()))
+
+    logging.info(f"Niche: {niche}")
+
+    filtered = filter_rooms(rooms, niche)
+
+    if not filtered:
+
+        logging.info("No niche matches, using fallback")
+
+        filtered = rooms
+
+    room = random.choice(filtered[:30])
 
     post_room(client, room)
 
-    logging.info("Bot finished")
+    logging.info("Done")
 
-
-# -----------------------------
 
 if __name__ == "__main__":
     main()
